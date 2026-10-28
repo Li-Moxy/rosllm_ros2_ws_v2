@@ -1,0 +1,66 @@
+version: 1
+actions:
+  forward:
+    service: /turtle1/forward
+    description: |
+      Commands the turtle forward velocity for a fixed 1 second, then stops it.
+      The input must be a JSON object with a single key "vel" (metres per second,
+      within -2.0..2.0). The turtle keeps its heading.
+    parameters:
+      vel:
+        type: number
+        required: true
+        min: -2.0
+        max: 2.0
+        description: Forward velocity in metres per second.
+    verify:
+      observation: turtle_pose
+      field: position
+      metric: distance_2d
+      min_abs_delta: 0.05
+      direction: any
+
+  turn:
+    service: /turtle1/turn
+    description: |
+      Commands the turtle angular velocity for a fixed 1 second, then stops it.
+      The input must be a JSON object with a single key "vel" (radians per second,
+      within -2.0..2.0). Positive values turn counter-clockwise.
+    parameters:
+      vel:
+        type: number
+        required: true
+        min: -2.0
+        max: 2.0
+        description: Angular velocity in radians per second.
+    verify:
+      observation: turtle_pose
+      field: theta
+      min_abs_delta: 0.05
+      direction: any
+
+  command:
+    service: /turtle1/command
+    description: |
+      Commands forward, strafe and angular velocity for a fixed 1 second, then
+      stops the turtle. The input is a JSON object with keys "fwd_vel",
+      "strafe_vel" and "ang_vel" (each within -2.0..2.0). Turtlesim cannot move
+      laterally, so "strafe_vel" must be 0.0.
+    parameters:
+      fwd_vel:
+        type: number
+        required: true
+        min: -2.0
+        max: 2.0
+        description: Forward velocity in metres per second.
+      strafe_vel:
+        type: number
+        required: true
+        enum: [0.0]
+        description: Must be 0.0; turtlesim has no lateral motion.
+      ang_vel:
+        type: number
+        required: true
+        min: -2.0
+        max: 2.0
+        description: Angular velocity in radians per second.

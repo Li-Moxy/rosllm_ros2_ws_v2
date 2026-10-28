@@ -1,0 +1,14 @@
+rosllm_agent	/home/moxy/rosllm_ros2_ws_v2/src/rosllm_agent	(ros.ament_python)
+rosllm_core	/home/moxy/rosllm_ros2_ws_v2/src/rosllm_core	(ros.ament_python)
+rosllm_executor	/home/moxy/rosllm_ros2_ws_v2/src/rosllm_executor	(ros.ament_python)
+rosllm_msgs	/home/moxy/rosllm_ros2_ws_v2/src/rosllm_msgs	(ros.ament_cmake)
+rosllm_observation	/home/moxy/rosllm_ros2_ws_v2/src/rosllm_observation	(ros.ament_python)
+rosllm_srvs	/home/moxy/rosllm_ros2_ws_v2/src/rosllm_srvs	(ros.ament_cmake)
+rosllm_turtlesim	/home/moxy/rosllm_ros2_ws_v2/src/rosllm_turtlesim	(ros.ament_python)
+string behavior        # behavior string
+---
+bool success           # success flag
+string message         # human-readable message
+int32 info             # information flag
+rosllm_executor behavior_tree_executor
+rosllm_executor sequence_executor

@@ -1,0 +1,2 @@
+[INFO] [1793165785.642463367] [turtle_actions]: turtle actions ready at /turtle1/{forward,turn,command}; max_linear=2.0 max_angular=2.0 duration=1.0s
+{"probe": "strafe_partial", "response_info": -6, "response_success": false, "completed_steps": 1, "dummy_forward_calls": 1, "last_error": "{\"error\": \"turtlesim cannot strafe (lateral motion); strafe_vel must be 0\"}"}

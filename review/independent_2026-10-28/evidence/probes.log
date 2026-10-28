@@ -1,0 +1,8 @@
+{"probe": "timeout_overlap", "response_infos": [-9, -9], "calls": 2, "start_gap": 0.2094246380002005, "action_duration": 1.5, "overlap": true}
+[INFO] [1793165715.137943879] [turtle_observation]: turtle observation ready at /turtle1/observation (10.0 Hz)
+[INFO] [1793165715.172093643] [observation_manager]: observation manager ready: topics=['turtle_pose'] services=[] staleness=0.30s
+{"probe": "stale_pose", "since_last_source_pose": 1.2042737009996927, "configured_staleness": 0.3, "reported_status": "fresh", "reported_age": 0.054206, "payload": {"x": 5.0, "y": 5.0, "theta": 0.0, "linear_velocity": 0.0, "angular_velocity": 0.0}}
+{"probe": "shutdown", "node_still_valid": true, "node_name": "independent_shutdown_probe", "declared_node_attr": false}
+{"probe": "forward_heading", "actual_distance": 1.0, "verified": false, "reason": "observed change +0.0000 is not greater than 0.05"}
+[INFO] [1793165717.022751552] [turtle_actions]: turtle actions ready at /turtle1/{forward,turn,command}; max_linear=2.0 max_angular=2.0 duration=1.0s
+{"probe": "strafe_precheck", "parsed_steps": 2, "plan_accepted": true, "command_service_success": false, "command_output": "{\"error\": \"turtlesim cannot strafe (lateral motion); strafe_vel must be 0\"}"}

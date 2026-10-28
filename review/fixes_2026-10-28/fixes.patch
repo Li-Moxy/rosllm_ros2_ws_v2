@@ -1,0 +1,742 @@
+--- a/src/rosllm_core/rosllm_core/action_client.py
++++ b/src/rosllm_core/rosllm_core/action_client.py
+@@ -266,10 +266,7 @@
+         except Exception:
+             pass
+         self._thread.join(timeout=2.0)
+-        try:
+-            self._node.destroy_node()
+-        except Exception:
+-            pass
++        self.node.destroy_node()
+ 
+     def __enter__(self):
+         return self
+--- a/src/rosllm_core/rosllm_core/lease.py
++++ b/src/rosllm_core/rosllm_core/lease.py
+@@ -1,9 +1,7 @@
+ """Cross-process, plan-level mutual exclusion.
+ 
+-Only one plan may control a robot at a time, even if two executor processes
+-(sequence and behaviour-tree) are started by mistake.  ``flock`` is released
+-automatically by the kernel when the owning process exits, so a crashed
+-executor cannot leave a permanent stale lock.
++Only one plan may control a robot at a time. An uncertain action leaves a
++recovery marker in the shared file, surviving executor shutdown/restart.
+ """
+ 
+ from __future__ import annotations
+@@ -63,6 +61,11 @@
+             os.close(fd)
+             raise LeaseError(f"cannot lock lease file: {exc}") from exc
+ 
++        holder = self._read_holder()
++        if holder and holder.get("recovery_required"):
++            os.close(fd)
++            return LeaseResult(False, holder, "recovery_required")
++
+         payload = {
+             "owner": owner,
+             "pid": os.getpid(),
+@@ -80,6 +83,53 @@
+             pass
+         self._fd = fd
+         return LeaseResult(True, payload, "")
++
++    def mark_uncertain(self, reason: str) -> None:
++        """Persist unknown execution state while this plan still owns the lock."""
++        if self._fd is None:
++            raise LeaseError("cannot mark uncertainty without owning the lease")
++        payload = self._read_holder() or {"robot_id": self.robot_id}
++        payload.update(recovery_required=True, reason=reason)
++        try:
++            self._write_holder(self._fd, payload)
++        except OSError as exc:
++            raise LeaseError(f"cannot persist recovery state: {exc}") from exc
++
++    def confirm_stopped(self, owner: str) -> LeaseResult:
++        """Caller attests the robot is stopped; never clear an active plan's lock.
++
++        This is an acknowledgement, not a remote cancellation or a sensor check.
++        The same flock serialises acknowledgement and new plan acquisition.
++        """
++        if self.held:
++            return LeaseResult(False, reason="a plan is still executing")
++        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
++        try:
++            try:
++                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except BlockingIOError:
++                return LeaseResult(False, reason="a plan is still executing")
++            self._write_holder(fd, {
++                "robot_id": self.robot_id,
++                "recovery_required": False,
++                "confirmed_by": owner,
++                "confirmed_at": time.time(),
++            })
++            return LeaseResult(True, reason="stopped state acknowledged")
++        except OSError as exc:
++            raise LeaseError(f"cannot acknowledge stopped state: {exc}") from exc
++        finally:
++            os.close(fd)
++
++    @staticmethod
++    def _write_holder(fd: int, payload: dict) -> None:
++        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
++        os.lseek(fd, 0, os.SEEK_SET)
++        with os.fdopen(os.dup(fd), "wb") as stream:
++            stream.write(data)
++            stream.truncate()
++            stream.flush()
++            os.fsync(stream.fileno())
+ 
+     def release(self) -> None:
+         fd = self._fd
+--- a/src/rosllm_core/rosllm_core/library.py
++++ b/src/rosllm_core/rosllm_core/library.py
+@@ -95,6 +95,7 @@
+     field: str
+     min_abs_delta: float = 1e-6
+     direction: str = "any"
++    metric: str = "delta"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -369,7 +370,7 @@
+         if not isinstance(spec, dict):
+             raise LibraryError(f"action {action!r} 'verify' must be a mapping")
+         unknown = sorted(
+-            set(spec) - {"observation", "field", "min_abs_delta", "direction"}
++            set(spec) - {"observation", "field", "min_abs_delta", "direction", "metric"}
+         )
+         if unknown:
+             raise LibraryError(f"action {action!r} verify has unknown key(s) {unknown!r}")
+@@ -391,11 +392,17 @@
+             raise LibraryError(
+                 f"action {action!r} verify.direction must be one of {_ALLOWED_DIRECTIONS}"
+             )
++        metric = spec.get("metric", "delta")
++        if metric not in ("delta", "distance_2d"):
++            raise LibraryError(f"action {action!r} verify.metric must be delta or distance_2d")
++        if metric == "distance_2d" and direction != "any":
++            raise LibraryError("distance_2d requires direction=any")
+         return VerifySpec(
+             observation=observation,
+             field=field_name,
+             min_abs_delta=float(delta),
+             direction=direction,
++            metric=metric,
+         )
+ 
+     # ------------------------------------------------------------- accessors
+--- a/src/rosllm_core/rosllm_core/observation.py
++++ b/src/rosllm_core/rosllm_core/observation.py
+@@ -304,7 +304,17 @@
+             False,
+             f"field {verify.field!r} is missing from the observation payload",
+         )
+-    for value in (value_before, value_after):
++    if verify.metric == "distance_2d":
++        if not all(isinstance(point, dict) and "x" in point and "y" in point
++                   for point in (value_before, value_after)):
++            return VerificationCheck(
++                action, verify.observation, verify.field, False,
++                "distance_2d requires objects containing numeric x and y",
++            )
++        values = [point[axis] for point in (value_before, value_after) for axis in ("x", "y")]
++    else:
++        values = (value_before, value_after)
++    for value in values:
+         if isinstance(value, bool) or not isinstance(value, (int, float)):
+             return VerificationCheck(
+                 action,
+@@ -325,7 +335,13 @@
+                 value_before,
+                 value_after,
+             )
+-    delta = float(value_after) - float(value_before)
++    if verify.metric == "distance_2d":
++        delta = math.hypot(
++            float(value_after["x"]) - float(value_before["x"]),
++            float(value_after["y"]) - float(value_before["y"]),
++        )
++    else:
++        delta = float(value_after) - float(value_before)
+     if abs(delta) <= verify.min_abs_delta:
+         return VerificationCheck(
+             action,
+--- /dev/null
++++ b/src/rosllm_core/test/test_action_client_lifecycle.py
+@@ -0,0 +1,23 @@
++import os
++import random
++
++import pytest
++import rclpy
++from rclpy.impl.implementation_singleton import rclpy_implementation
++
++from rosllm_core.action_client import ClientHost
++
++
++def test_shutdown_destroys_node_and_is_idempotent():
++    os.environ["ROS_DOMAIN_ID"] = str(random.randint(10, 220))
++    os.environ["ROS_LOCALHOST_ONLY"] = "1"
++    rclpy.init()
++    host = ClientHost("lifecycle_regression")
++    try:
++        host.shutdown()
++        host.shutdown()
++        with pytest.raises(rclpy_implementation.InvalidHandle):
++            host.node.get_name()
++    finally:
++        host.shutdown()
++        rclpy.shutdown()
+--- a/src/rosllm_core/test/test_lease.py
++++ b/src/rosllm_core/test/test_lease.py
+@@ -48,6 +48,36 @@
+         PlanLease("x" * 129, str(tmp_path))
+ 
+ 
++def test_uncertain_state_survives_release_and_new_instance(tmp_path):
++    lease = PlanLease("uncertain-robot", str(tmp_path))
++    assert lease.try_acquire("first", "plan-1").granted
++    lease.mark_uncertain("remote action timed out")
++    lease.release()
++    replacement = PlanLease("uncertain-robot", str(tmp_path))
++    result = replacement.try_acquire("replacement")
++    assert not result.granted and result.reason == "recovery_required"
++    assert result.holder["reason"] == "remote action timed out"
++    assert replacement.confirm_stopped("operator").granted
++    assert replacement.try_acquire("after-confirmation").granted
++    replacement.release()
++
++
++def test_confirmation_cannot_unlock_an_active_plan(tmp_path):
++    first = PlanLease("active-robot", str(tmp_path))
++    second = PlanLease("active-robot", str(tmp_path))
++    assert first.try_acquire("first").granted
++    assert not first.confirm_stopped("same-process").granted
++    assert not second.confirm_stopped("other-process").granted
++    assert first.held
++    first.release()
++
++
++def test_mark_uncertain_requires_ownership(tmp_path):
++    lease = PlanLease("robot", str(tmp_path))
++    with pytest.raises(LeaseError, match="owning"):
++        lease.mark_uncertain("no active plan")
++
++
+ def _hold_in_child(directory, queue):
+     lease = PlanLease("child-robot", directory)
+     granted = lease.try_acquire("child").granted
+--- a/src/rosllm_core/test/test_library.py
++++ b/src/rosllm_core/test/test_library.py
+@@ -56,6 +56,19 @@
+     assert "'forward'" in text
+     assert "/test/forward" in text
+     assert '"vel"' in text
++
++
++def test_planar_verification_config(tmp_path):
++    data = base_data()
++    data["actions"]["forward"]["verify"].update(field="position", metric="distance_2d")
++    spec = ActionLibrary.load(write(tmp_path, data)).get("forward").verify
++    assert spec.metric == "distance_2d" and spec.field == "position"
++    data["actions"]["forward"]["verify"]["direction"] = "increase"
++    with pytest.raises(LibraryError, match="direction=any"):
++        ActionLibrary.load(write(tmp_path, data))
++    data["actions"]["forward"]["verify"].update(direction="any", metric="invalid")
++    with pytest.raises(LibraryError, match="verify.metric"):
++        ActionLibrary.load(write(tmp_path, data))
+ 
+ 
+ def test_description_file(tmp_path):
+--- a/src/rosllm_core/test/test_observation.py
++++ b/src/rosllm_core/test/test_observation.py
+@@ -1,4 +1,5 @@
+ import json
++import pytest
+ from types import SimpleNamespace
+ 
+ from rosllm_core.library import VerifySpec
+@@ -140,3 +141,23 @@
+     assert entry_from_snapshot(None) is None
+     assert entry_from_snapshot({}) is None
+     assert entry_from_snapshot({"name": "pose", "age_sec": "x"}) is not None
++
++
++@pytest.mark.parametrize("end", [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)])
++def test_planar_displacement_is_independent_of_heading(end):
++    def position(x, y):
++        return view(message("pose", {"position": {"x": x, "y": y}},
++                            {"status": "fresh", "age_sec": 0.0})).get("pose")
++    spec = VerifySpec("pose", "position", 0.05, metric="distance_2d")
++    check = verify_effect("forward", spec, position(0, 0), position(*end))
++    assert check.ok and check.delta == pytest.approx(1.0)
++
++
++@pytest.mark.parametrize("point", [{"x": 0, "y": 0}, {"x": 1}, {"x": True, "y": 1},
++                                   {"x": "bad", "y": 1}, {"x": float('inf'), "y": 1}])
++def test_planar_displacement_rejects_no_motion_or_bad_coordinates(point):
++    before = entry_from_snapshot({"name": "pose", "status": "fresh",
++                                  "payload": {"position": {"x": 0, "y": 0}}})
++    after = entry_from_snapshot({"name": "pose", "status": "fresh", "payload": {"position": point}})
++    assert not verify_effect("forward", VerifySpec("pose", "position", 0.05,
++                            metric="distance_2d"), before, after).ok
+--- a/src/rosllm_executor/package.xml
++++ b/src/rosllm_executor/package.xml
+@@ -12,6 +12,7 @@
+   <exec_depend>rclpy</exec_depend>
+   <exec_depend>rosllm_core</exec_depend>
+   <exec_depend>rosllm_srvs</exec_depend>
++  <exec_depend>std_srvs</exec_depend>
+   <test_depend>python3-pytest</test_depend>
+   <test_depend>rosllm_msgs</test_depend>
+ 
+--- a/src/rosllm_executor/rosllm_executor/executor_base.py
++++ b/src/rosllm_executor/rosllm_executor/executor_base.py
+@@ -15,6 +15,7 @@
+ from rclpy.executors import MultiThreadedExecutor
+ from rclpy.node import Node
+ from rosllm_srvs.srv import AtomicAction, ExecuteBehavior, Observation
++from std_srvs.srv import Trigger
+ 
+ from rosllm_core.action_client import CallStatus, ClientHost
+ from rosllm_core.info import Info
+@@ -81,6 +82,10 @@
+             service_name,
+             self._handle,
+             callback_group=self._callback_group,
++        )
++        self._recovery_srv = self.create_service(
++            Trigger, service_name.rstrip("/") + "/confirm_stopped",
++            self._confirm_stopped, callback_group=self._callback_group,
+         )
+         self.get_logger().info(
+             "execute_behavior ready: actions=%s services=%s robot_id=%r lease=%s"
+@@ -172,6 +177,15 @@
+             return self._respond(response, report)
+         if not lease.granted:
+             holder = lease.holder or {}
++            if lease.reason == "recovery_required":
++                return self._respond(response, ExecutionReport(
++                    status=ExecStatus.UNKNOWN,
++                    info=int(Info.UNKNOWN_STATE),
++                    message=("previous action state is unconfirmed: "
++                             f"{holder.get('reason', '')}; confirm the robot is stopped "
++                             "before calling the confirm_stopped service"),
++                    plan_id=plan_id, robot_id=self.robot_id,
++                ))
+             report = ExecutionReport(
+                 status=ExecStatus.BUSY,
+                 info=int(Info.BUSY),
+@@ -185,6 +199,7 @@
+             )
+             return self._respond(response, report)
+ 
++        report = None
+         try:
+             try:
+                 parsed = self._parse(request.behavior)
+@@ -232,10 +247,27 @@
+                 elapsed_sec=time.monotonic() - started,
+             )
+         finally:
+-            self.lease.release()
++            try:
++                if report is not None and report.status in (ExecStatus.TIMEOUT, ExecStatus.UNKNOWN):
++                    self.lease.mark_uncertain(report.message)
++            except LeaseError as exc:
++                # Keep the lock if persistence fails; never silently admit a new plan.
++                self.get_logger().error(str(exc))
++            else:
++                self.lease.release()
+ 
+         report.elapsed_sec = time.monotonic() - started
+         return self._respond(response, report)
++
++    def _confirm_stopped(self, request, response):
++        try:
++            result = self.lease.confirm_stopped(self.get_name())
++            response.success = result.granted
++            response.message = result.reason
++        except (LeaseError, OSError) as exc:
++            response.success = False
++            response.message = str(exc)
++        return response
+ 
+     def _respond(self, response, report: ExecutionReport):
+         response.success = report.success
+--- a/src/rosllm_executor/test/test_executor_integration.py
++++ b/src/rosllm_executor/test/test_executor_integration.py
+@@ -18,6 +18,7 @@
+ from rclpy.node import Node
+ from rosllm_msgs.msg import Observation as ObservationMsg
+ from rosllm_srvs.srv import AtomicAction, ExecuteBehavior, Observation
++from std_srvs.srv import Trigger
+ 
+ from rosllm_core.action_client import ClientHost
+ from rosllm_core.jsonutil import dumps, loads
+@@ -227,6 +228,7 @@
+     base = {
+         "action_library_path": str(library),
+         "robot_id": robot_id,
++        "lease_dir": str(tmp_path),
+         "service_name": service_name,
+         "step_timeout_sec": 2.0,
+         "plan_timeout_sec": 15.0,
+@@ -417,6 +419,35 @@
+         stop_proc(handle)
+ 
+ 
++def test_timeout_blocks_new_plans_across_restart_until_confirmed(caller, world, tmp_path):
++    library = make_library(tmp_path / "lib.yaml")
++    params = {"step_timeout_sec": 0.2, "enable_observation_snapshots": False}
++    handle = start_executor(tmp_path, library, params=params)
++    world.delay = 1.0
++    behavior = '{"name":"forward","input":{"vel":1}}'
++    try:
++        host = caller()
++        response, _ = call_plan(host, handle, behavior)
++        assert response.info == -9
++        response, _ = call_plan(host, handle, behavior)
++        assert response.info == -10 and world.call_count() == 1
++        stop_proc(handle)
++        handle = start_executor(tmp_path, library, params=params)
++        response, _ = call_plan(host, handle, behavior)
++        assert response.info == -10 and world.call_count() == 1
++        # The dummy action has actually finished before the operator acknowledgement.
++        assert wait_until(lambda: bool(world.calls[0].get("output")))
++        world.delay = 0.0
++        reset = handle.service + "/confirm_stopped"
++        host.create_client(reset, Trigger)
++        ack = host.call(reset, Trigger.Request(), 3.0)
++        assert ack.ok and ack.response.success
++        response, _ = call_plan(host, handle, behavior)
++        assert response.success and world.call_count() == 2
++    finally:
++        stop_proc(handle)
++
++
+ def test_concurrent_plans_only_one_is_accepted(caller, world, tmp_path):
+     library = make_library(tmp_path / "lib.yaml")
+     handle = start_executor(tmp_path, library)
+@@ -433,6 +464,10 @@
+         thread = threading.Thread(target=run_first)
+         thread.start()
+         assert wait_until(lambda: world.call_count() >= 1)
++        reset = handle.service + "/confirm_stopped"
++        second_host.create_client(reset, Trigger)
++        ack = second_host.call(reset, Trigger.Request(), 3.0)
++        assert ack.ok and not ack.response.success
+         response, report = call_plan(
+             second_host, handle, '{"name": "forward", "input": {"vel": 1}}'
+         )
+--- a/src/rosllm_turtlesim/config/action_library.yaml
++++ b/src/rosllm_turtlesim/config/action_library.yaml
+@@ -15,7 +15,8 @@
+         description: Forward velocity in metres per second.
+     verify:
+       observation: turtle_pose
+-      field: x
++      field: position
++      metric: distance_2d
+       min_abs_delta: 0.05
+       direction: any
+ 
+@@ -55,8 +56,7 @@
+       strafe_vel:
+         type: number
+         required: true
+-        min: -2.0
+-        max: 2.0
++        enum: [0.0]
+         description: Must be 0.0; turtlesim has no lateral motion.
+       ang_vel:
+         type: number
+--- a/src/rosllm_turtlesim/rosllm_turtlesim/turtle_observation.py
++++ b/src/rosllm_turtlesim/rosllm_turtlesim/turtle_observation.py
+@@ -25,6 +25,7 @@
+             raise RuntimeError("parameter 'rate_hz' must be within 0.1..100")
+         self._lock = threading.Lock()
+         self._pose: Pose | None = None
++        self._pose_updated = False
+         self.create_subscription(
+             Pose, str(self.get_parameter("pose_topic").value), self._on_pose, 10
+         )
+@@ -40,10 +41,16 @@
+     def _on_pose(self, message: Pose) -> None:
+         with self._lock:
+             self._pose = message
++            self._pose_updated = True
+ 
+     def _publish(self) -> None:
+         with self._lock:
++            # Publish only newly received source data. Repeating a cached pose
++            # would reset the observation manager's age during a sensor outage.
++            if not self._pose_updated:
++                return
+             pose = self._pose
++            self._pose_updated = False
+         if pose is None:
+             return
+         message = String()
+@@ -51,6 +58,7 @@
+             {
+                 "x": pose.x,
+                 "y": pose.y,
++                "position": {"x": pose.x, "y": pose.y},
+                 "theta": pose.theta,
+                 "linear_velocity": pose.linear_velocity,
+                 "angular_velocity": pose.angular_velocity,
+--- /dev/null
++++ b/src/rosllm_turtlesim/test/test_pose_source_integration.py
+@@ -0,0 +1,69 @@
++"""Regression: a live adapter must not hide an upstream pose outage."""
++import os
++import random
++import threading
++import time
++
++import rclpy
++from rclpy.executors import MultiThreadedExecutor
++from rclpy.node import Node
++from rosllm_srvs.srv import Observation
++from turtlesim.msg import Pose
++
++from rosllm_core.action_client import ClientHost
++from rosllm_core.observation import ObservationView
++from rosllm_observation.observation_manager_node import ObservationManagerNode
++from rosllm_turtlesim.turtle_observation import TurtleObservation
++
++
++def test_pose_outage_becomes_stale_and_new_pose_recovers(tmp_path):
++    os.environ["ROS_DOMAIN_ID"] = str(random.randint(10, 220))
++    os.environ["ROS_LOCALHOST_ONLY"] = "1"
++    config = tmp_path / "observations.yaml"
++    config.write_text("staleness_sec: 0.3\nobservations_topics:\n"
++                      "  - name: turtle_pose\n    topic: /turtle1/observation\n")
++    rclpy.init(args=["--ros-args", "-p", f"config_filename:={config}"])
++    adapter = TurtleObservation()
++    manager = ObservationManagerNode()
++    sensor = Node("one_shot_pose_source")
++    publisher = sensor.create_publisher(Pose, "/turtle1/pose", 10)
++    executor = MultiThreadedExecutor(num_threads=4)
++    for node in (adapter, manager, sensor):
++        executor.add_node(node)
++    thread = threading.Thread(target=executor.spin, daemon=True)
++    thread.start()
++    caller = ClientHost("pose_source_regression")
++    caller.create_client("/get_observation", Observation)
++
++    def wait_entry(predicate, timeout=4.0):
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            result = caller.call("/get_observation", Observation.Request(), 1.0)
++            if result.ok:
++                entry = ObservationView.from_messages(result.response.observation).get("turtle_pose")
++                if entry and predicate(entry):
++                    return entry
++            time.sleep(0.02)
++        raise AssertionError("expected observation state was never received")
++
++    try:
++        assert caller.wait_ready("/get_observation", 4.0)
++        deadline = time.monotonic() + 4.0
++        while publisher.get_subscription_count() == 0 and time.monotonic() < deadline:
++            time.sleep(0.02)
++        assert publisher.get_subscription_count() > 0
++        publisher.publish(Pose(x=5.0, y=5.0))
++        assert wait_entry(lambda entry: entry.status == "fresh").payload["position"] == {"x": 5.0, "y": 5.0}
++        stale = wait_entry(lambda entry: entry.status == "stale")
++        assert stale.age_sec >= 0.3
++        publisher.publish(Pose(x=5.0, y=6.0))
++        recovered = wait_entry(lambda entry: entry.status == "fresh" and entry.payload["y"] == 6.0)
++        assert recovered.payload["position"]["y"] == 6.0
++    finally:
++        executor.shutdown(timeout_sec=3.0)
++        thread.join(timeout=3.0)
++        caller.shutdown()
++        manager.shutdown()
++        for node in (adapter, manager, sensor):
++            node.destroy_node()
++        rclpy.shutdown()
+--- a/src/rosllm_turtlesim/test/test_turtlesim_integration.py
++++ b/src/rosllm_turtlesim/test/test_turtlesim_integration.py
+@@ -17,6 +17,8 @@
+ 
+ from rosllm_core.action_client import ClientHost
+ from rosllm_core.observation import ObservationView
++from rosllm_core.library import ActionLibrary
++from rosllm_core.plan import PlanError, parse_plan
+ 
+ os.environ["ROS_DOMAIN_ID"] = str(random.randint(10, 220))
+ os.environ["ROS_LOCALHOST_ONLY"] = "1"
+@@ -200,3 +202,16 @@
+ 
+     still_ok = demo.host.call("/get_observation", Observation.Request(), 5.0)
+     assert still_ok.ok and still_ok.response.observation
++
++
++def test_nonzero_strafe_is_rejected_before_any_plan_action(demo):
++    share = Path(get_package_share_directory("rosllm_turtlesim"))
++    library = ActionLibrary.load(share / "config/action_library.yaml")
++    behavior = ('{"name":"forward","input":{"vel":1}}\n'
++                '{"name":"command","input":{"fwd_vel":1,"strafe_vel":1,"ang_vel":0}}')
++    with pytest.raises(PlanError):
++        parse_plan(behavior, library)
++    result = demo.host.call("/execute_behavior", ExecuteBehavior.Request(behavior=behavior), 5.0)
++    assert result.ok and result.response.info == -7
++    report = json.loads(result.response.message)
++    assert report["completed_steps"] == 0 and report["steps"] == []
+--- a/README.md
++++ b/README.md
+@@ -144,7 +144,7 @@
+ {"status":"success_verified","exit_code":0,...}
+ ```
+ 
+-并可在 `verification` 中看到每一步的观测变化（`x` 或 `theta` 的 delta）。
++并可在 `verification` 中看到每一步的观测变化（二维位移或 `theta` 的 delta）。
+ Agent 退出码：`0` 成功；`2` 规划/执行/核验失败；`3` 超时或未知；`4` 忙。
+ 
+ 直接调用原子动作（调试）：
+@@ -265,7 +265,8 @@
+       vel: {type: number, required: true, min: -2.0, max: 2.0}
+     verify:
+       observation: turtle_pose
+-      field: x
++      field: position
++      metric: distance_2d
+       min_abs_delta: 0.05
+       direction: any
+ ```
+@@ -330,20 +331,22 @@
+ ## 7. 安全与执行语义
+ 
+ 1. **计划级互斥**：执行器用 `/tmp/rosllm_plan_<robot_id hash>.lock` 的
+-   `flock` 做跨进程互斥；进程崩溃时内核自动释放。第二个计划立即返回
++   `flock` 做跨进程互斥。正常执行中第二个计划立即返回
+    `success=false, info=-8`，不执行任何动作。测试覆盖同进程并发和两个执行器
+    进程。
+ 2. **先校验后执行**：整份 NDJSON 先逐行解析、按动作库校验名称/参数类型/范围/
+    有限数值/长度/步数，再预检**所有**动作服务是否存在；任何一项失败都不会
+    执行前面的动作。
+ 3. **超时语义**：服务客户端超时只取消本地等待，**不代表服务端动作停止**。
+-   超时返回 `-9` 并标记状态未知风险；不会自动重发动作或整份计划。ROS 2
++   超时返回 `-9`，并在共享租约文件中持久化待确认标记；后续计划返回 `-10`，
++   直到确认停止后调用恢复服务。节点重启不会清除该标记。不会自动重发动作或整份计划。ROS 2
+    service 不支持取消远端执行；若换成 ROS Action，需要另行定义取消/反馈
+    语义（本版未使用 ROS Action）。
+ 4. **失败/超时/未知区分**：动作明确 `success=false` 是 `failed`；本地超时是
+    `timeout`；传输错误可能已执行，是 `unknown`；服务不存在是 `unavailable`。
+ 5. **观测新鲜度**：观测管理器在 `Observation.text` 中附加保留元数据：
+    `__rosllm_meta__:{"status":"fresh|stale|missing|error","age_sec":...}`。
++   Turtlesim 转换节点仅发布新收到的源位姿，断流后不会重复刷新旧数据。
+    Agent 在规划前拒绝缺失/过期观测。没有元数据的自定义观测为 `unknown_age`，
+    可用 `require_observation_age:=true` 强制要求。
+ 6. **结果核验**：执行器在每步成功后抓取观测快照；Agent 按动作库的 `verify`
+@@ -371,16 +374,34 @@
+ colcon test-result --verbose
+ ```
+ 
+-结果：**157 tests, 0 errors, 0 failures, 0 skipped**。
+-
+-- 单元测试：113（core）+ 4（report）+ 8（prompt）+ 2（template）= 127
+-- ROS 2 集成测试：15（executor）+ 7（agent 全链路）+ 4（LLM 节点）+
+-  3（observation manager）+ 1（Turtlesim 全链路）= 30
++修复后重新实测：**177 tests, 0 errors, 0 failures, 0 skipped**。
++
++按包统计：core 129、executor 20、agent 20、observation 5、turtlesim 3。
++包含断流恢复、超时后跨进程/重启保护、显式恢复、客户端销毁、四个方向位移
++核验和非法后继参数零执行等回归用例。
+ 
+ 详细命令、逐项验收矩阵、旧版问题与环境说明见 `TEST_REPORT.md`；逐模块覆盖
+ 状态见 `PORTING.md`。
+ 
+ ---
++
++## 超时后的恢复流程（2026-10-28 修复）
++
++执行器超时/状态未知后，在相同主机、相同 `lease_dir` 和 `robot_id` 下拒绝新计划。
++需先通过控制器状态、现场检查等方式确认旧动作已结束且机器人已停止，再调用：
++
++```bash
++ros2 service call /execute_behavior/confirm_stopped std_srvs/srv/Trigger '{}'
++```
++
++服务只表示调用者确认停止，不发送停止命令，也不自动检查硬件状态；活动计划
++尚未返回时拒绝恢复。自定义 `service_name` 时，恢复服务名为其后加
++`/confirm_stopped`。持久化标记与租约存于同一文件；不要删除文件来绕过保护。
++默认 `/tmp` 在系统重启/清理后可能消失，此机制不代替控制器、硬件安全或跨主机协调。
++
++新增 ROS 依赖：`std_srvs`；未增加 pip 依赖。观测保留原有 x/y 字段，并新增
++`position: {x, y}`，供 `metric: distance_2d` 计算与朝向无关的位移。默认横移
++参数用 `enum: [0.0]` 在整个计划执行前拒绝非法值。
+ 
+ ## 9. 已知限制
+ 
+--- a/TEST_REPORT.md
++++ b/TEST_REPORT.md
+@@ -1,4 +1,7 @@
+ # 实际验收报告
++
++> 最新修复验收：177 tests，0 errors、0 failures、0 skipped。详见文末第 9 节；
++> 原第 1–8 节保留首版验收历史，不能代表修复后的当前测试数量。
+ 
+ 日期：2026-10-28
+ 工作区：`/home/moxy/rosllm_ros2_ws_v2`
+@@ -293,3 +296,37 @@
+   --task "Move forward, turn left, then move forward again" --json \
+   --library "$SHARE/config/action_library.yaml"
+ ```
++
++
++## 9. 独立复核后修复验收（2026-10-28）
++
++修复独立报告中的五项问题：未知动作状态后的计划隔离；源位姿断流；
++ClientHost 节点销毁；前进二维位移核验；横移参数预检。
++
++本次使用仅加载 Humble 的环境，重新构建到 `/tmp/rosllm_v2_fix`，再运行：
++
++```bash
++source /opt/ros/humble/setup.bash
++source /tmp/rosllm_v2_fix/install/setup.bash
++PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
++  colcon --log-base /tmp/rosllm_v2_fix/test-log test \
++  --base-paths /home/moxy/rosllm_ros2_ws_v2/src \
++  --build-base /tmp/rosllm_v2_fix/build \
++  --install-base /tmp/rosllm_v2_fix/install --executor sequential
++colcon test-result --test-result-base /tmp/rosllm_v2_fix/build --verbose
++```
++
++实际结果：7 包构建完成，177 tests, 0 errors, 0 failures, 0 skipped。
++按包：core 129、executor 20、agent 20、observation 5、turtlesim 3。
++相较独立复核时的 160 项，新增 17 项；另在正常并发测试中增加活动计划拒绝恢复断言。
++
++- 超时后新计划被拒绝，执行器重启后仍被拒绝；桩动作确认完成、显式恢复后才接受。
++- 确认服务不能解除正在执行计划的锁；同主机共享状态对其他执行器有效。
++- 一帧源位姿后停止发送，会变为 stale；重新发送源位姿恢复 fresh。
++- shutdown 后 ROS 节点 handle 无效，重复 shutdown 不报错。
++- 向 ±x、±y 移动均可通过二维位移核验；不动和错误坐标被拒绝。
++- 非零 strafe 的混合计划在预检阶段拒绝，completed_steps=0，steps=[]。
++- 默认 fake LLM + 真实 Turtlesim 三步链路继续通过。
++
++真实模型 API、本机以外的控制器、EAIR 仿真和真机未在本次修复中验证。
++确认停止服务是显式声明，不是硬件停止检测，也不是远端取消服务。
+--- a/PORTING.md
++++ b/PORTING.md
+@@ -173,3 +173,13 @@
+ - **第三阶段（有限实现 + 评估）**：受限行为树；VLM/GUI/图像摘要器/
+   `general_sensor_summarizer` 未实现并记录；`code_executor` 排除；
+   `state_machine_executor` 不适用；首版不扩展 EAIR 硬件。
++
++
++## 2026-10-28 独立复核后修复
++
++保留原有消息/服务字段。新增 `std_srvs/Trigger` 类型的
++`<execute_service>/confirm_stopped` 恢复入口；超时/未知状态标记存入共享租约文件，
++同主机同 robot_id/lease_dir 的执行器必须显式确认后才能恢复计划接收。
++Turtlesim 观测仅转发新源位姿，增加 position 对象用于二维位移核验；
++原有 x/y/theta 字段保留。动作库新增可选 verify.metric（默认 delta，
++另支持 distance_2d），旧动作库和 VerifySpec 位置参数保持兼容。

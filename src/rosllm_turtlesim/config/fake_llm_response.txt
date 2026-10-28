@@ -1,0 +1,7 @@
+This is fake LLM output.
+
+```json
+{"name": "forward", "input": {"vel": 1.0}}
+{"name": "turn", "input": {"vel": 1.0}}
+{"name": "forward", "input": {"vel": 0.8}}
+```

@@ -1,0 +1,6 @@
+# Observation manager configuration for the Turtlesim demo.
+staleness_sec: 2.0
+observations_topics:
+  - name: turtle_pose
+    topic: /turtle1/observation
+observations_srvs: []

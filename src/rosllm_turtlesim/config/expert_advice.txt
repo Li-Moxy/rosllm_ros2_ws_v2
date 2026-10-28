@@ -1,0 +1,5 @@
+You will control a turtle in the Turtlesim simulator.
+Each atomic action commands a velocity for 1 second and then stops the turtle.
+Angles are measured in radians. Choose only actions and parameters from the
+library; never invent names or units. Prefer short sequences that stay inside
+the 11 x 11 simulator bounds.

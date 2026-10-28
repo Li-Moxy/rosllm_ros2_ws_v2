@@ -1,0 +1,16 @@
+Starting >>> rosllm_msgs
+Starting >>> rosllm_core
+Finished <<< rosllm_core [0.50s]
+Finished <<< rosllm_msgs [2.39s]
+Starting >>> rosllm_srvs
+Finished <<< rosllm_srvs [3.28s]
+Starting >>> rosllm_executor
+Starting >>> rosllm_observation
+Finished <<< rosllm_observation [0.62s]
+Finished <<< rosllm_executor [0.63s]
+Starting >>> rosllm_agent
+Finished <<< rosllm_agent [0.47s]
+Starting >>> rosllm_turtlesim
+Finished <<< rosllm_turtlesim [0.49s]
+
+Summary: 7 packages finished [7.41s]

@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rosllm_turtlesim</name>
+  <version>0.1.0</version>
+  <description>Turtlesim atomic actions, pose observation and offline demo launch for the unofficial ROSLLM ROS 2 port.</description>
+  <maintainer email="rosllm-ros2-port@example.com">ROSLLM ROS 2 port maintainers</maintainer>
+  <license>MIT</license>
+  <url type="repository">https://github.com/huawei-noah/HEBO/tree/master/ROSLLM</url>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>turtlesim</exec_depend>
+  <exec_depend>rosllm_core</exec_depend>
+  <exec_depend>rosllm_msgs</exec_depend>
+  <exec_depend>rosllm_srvs</exec_depend>
+  <exec_depend>rosllm_agent</exec_depend>
+  <exec_depend>rosllm_executor</exec_depend>
+  <exec_depend>rosllm_observation</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
